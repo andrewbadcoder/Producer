@@ -1,2 +1,2 @@
 # Producer
-tuff ahh AI producer
+tuff ahh AI producer, kanye's diciple
