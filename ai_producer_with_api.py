@@ -8,7 +8,17 @@ import joblib
 import os
 from typing import Dict, List, Tuple, Optional
 import warnings
+import json
+import re
 warnings.filterwarnings('ignore')
+
+# Import Anthropic API
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    print("Warning: anthropic package not installed. Run: pip install anthropic")
 
 class AudioProcessor:
     """Handles audio I/O and processing operations"""
@@ -239,12 +249,16 @@ class BeatGenerator:
             }
         }
     
-    def generate_beat_pattern(self, style: str, bars: int = 4) -> Dict:
+    def generate_beat_pattern(self, style: str, bars: int = 4, tempo: int = None) -> Dict:
         """Generate a beat pattern in the specified style"""
         if style not in self.drum_patterns:
             style = 'travis_scott'  # Default fallback
         
-        pattern = self.drum_patterns[style]
+        pattern = self.drum_patterns[style].copy()
+        
+        # Override tempo if specified
+        if tempo:
+            pattern['tempo'] = tempo
         
         # Extend pattern for multiple bars
         beat_pattern = {
@@ -281,14 +295,145 @@ class BeatGenerator:
         
         return audio
 
-class AIProducer:
-    """Main AI Producer orchestrating all components"""
+class AIPromptInterpreter:
+    """Interprets natural language prompts using Anthropic API"""
     
-    def __init__(self, sample_rate: int = 22050):
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or os.getenv('ANTHROPIC_API_KEY')
+        
+        if not ANTHROPIC_AVAILABLE:
+            raise ImportError("anthropic package not installed. Run: pip install anthropic")
+        
+        if not self.api_key:
+            raise ValueError("Anthropic API key required. Set ANTHROPIC_API_KEY environment variable or pass api_key parameter")
+        
+        self.client = anthropic.Anthropic(api_key=self.api_key)
+        
+        self.system_message = """You are an expert music producer with deep knowledge of hip-hop, trap, and contemporary music production. You specialize in understanding artist styles, beat composition, and audio production techniques.
+
+Your role is to interpret user requests about music production and provide structured JSON responses that can be used by an AI beat generation system.
+
+When a user asks for a beat or describes what they want, analyze their request and respond with a JSON object containing:
+
+{
+  "artist_style": "travis_scott" | "kanye_west" | "metro_boomin" | "unknown",
+  "tempo": number (BPM),
+  "mood": "dark" | "energetic" | "chill" | "aggressive" | "atmospheric" | "uplifting",
+  "instruments": ["kick", "snare", "hihat", "808", "melody", "pad"],
+  "duration": number (seconds),
+  "bars": number,
+  "description": "detailed description of the requested beat",
+  "production_notes": "specific production techniques or characteristics"
+}
+
+Artist Style Guidelines:
+- Travis Scott: 130-160 BPM, atmospheric, heavy autotune, frequent adlibs, 808 drums
+- Kanye West: 80-140 BPM, soul samples, vocal chops, orchestral elements, gospel influence
+- Metro Boomin: 130-150 BPM, dark atmosphere, heavy 808s, minimalist, trap-influenced
+
+Always respond with valid JSON only. No additional text or explanations."""
+
+    def interpret_prompt(self, user_prompt: str) -> Dict:
+        """Interpret user prompt and return structured beat parameters"""
+        try:
+            response = self.client.messages.create(
+                model="claude-3-haiku-20240307",
+                max_tokens=1000,
+                temperature=0.7,
+                system=self.system_message,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": user_prompt
+                    }
+                ]
+            )
+            
+            # Extract JSON from response
+            response_text = response.content[0].text.strip()
+            
+            # Try to extract JSON if it's wrapped in markdown or other text
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+            else:
+                json_str = response_text
+            
+            # Parse JSON response
+            beat_params = json.loads(json_str)
+            
+            # Validate required fields
+            required_fields = ['artist_style', 'tempo', 'mood', 'duration', 'bars']
+            for field in required_fields:
+                if field not in beat_params:
+                    beat_params[field] = self._get_default_value(field)
+            
+            return beat_params
+            
+        except Exception as e:
+            print(f"Error interpreting prompt: {e}")
+            # Return default parameters
+            return {
+                'artist_style': 'travis_scott',
+                'tempo': 140,
+                'mood': 'energetic',
+                'instruments': ['kick', 'snare', 'hihat', '808'],
+                'duration': 8.0,
+                'bars': 4,
+                'description': 'Default beat generation due to prompt interpretation error',
+                'production_notes': 'Using default parameters'
+            }
+    
+    def _get_default_value(self, field: str):
+        """Get default values for missing fields"""
+        defaults = {
+            'artist_style': 'travis_scott',
+            'tempo': 140,
+            'mood': 'energetic',
+            'instruments': ['kick', 'snare', 'hihat'],
+            'duration': 8.0,
+            'bars': 4,
+            'description': 'AI generated beat',
+            'production_notes': 'Standard production'
+        }
+        return defaults.get(field, None)
+
+class EnhancedAIProducer:
+    """Enhanced AI Producer with natural language processing"""
+    
+    def __init__(self, sample_rate: int = 22050, api_key: str = None):
         self.audio_processor = AudioProcessor(sample_rate)
         self.sampler = Sampler(self.audio_processor)
         self.style_recognizer = StyleRecognizer(self.audio_processor)
         self.beat_generator = BeatGenerator(self.audio_processor)
+        
+        # Initialize AI prompt interpreter if API key is available
+        self.prompt_interpreter = None
+        if api_key or os.getenv('ANTHROPIC_API_KEY'):
+            try:
+                self.prompt_interpreter = AIPromptInterpreter(api_key)
+                print("AI prompt interpretation enabled!")
+            except Exception as e:
+                print(f"Warning: Could not initialize AI prompt interpreter: {e}")
+    
+    def create_beat_from_prompt(self, user_prompt: str) -> Tuple[np.ndarray, Dict, Dict]:
+        """Create a beat from natural language prompt"""
+        if not self.prompt_interpreter:
+            raise ValueError("AI prompt interpreter not available. Provide ANTHROPIC_API_KEY.")
+        
+        # Interpret the prompt
+        beat_params = self.prompt_interpreter.interpret_prompt(user_prompt)
+        
+        # Generate beat based on interpreted parameters
+        pattern = self.beat_generator.generate_beat_pattern(
+            style=beat_params['artist_style'],
+            bars=beat_params['bars'],
+            tempo=beat_params['tempo']
+        )
+        
+        audio = self.beat_generator.create_beat_audio(pattern, beat_params['duration'])
+        
+        return audio, pattern, beat_params
     
     def analyze_sample(self, file_path: str) -> Dict:
         """Analyze an audio sample and return comprehensive information"""
@@ -314,9 +459,9 @@ class AIProducer:
             }
         }
     
-    def create_beat(self, style: str, duration: float = 8.0, bars: int = 4) -> Tuple[np.ndarray, Dict]:
+    def create_beat(self, style: str, duration: float = 8.0, bars: int = 4, tempo: int = None) -> Tuple[np.ndarray, Dict]:
         """Create a beat in the specified artist style"""
-        pattern = self.beat_generator.generate_beat_pattern(style, bars)
+        pattern = self.beat_generator.generate_beat_pattern(style, bars, tempo)
         audio = self.beat_generator.create_beat_audio(pattern, duration)
         
         return audio, pattern
@@ -366,19 +511,42 @@ class AIProducer:
         }
 
 def main():
-    """Example usage of the AI Producer"""
-    producer = AIProducer()
+    """Example usage of the Enhanced AI Producer"""
+    # Initialize with API key (set ANTHROPIC_API_KEY environment variable)
+    producer = EnhancedAIProducer()
     
-    print("AI Producer initialized!")
-    print("Available artist styles: travis_scott, kanye_west, metro_boomin")
+    print("Enhanced AI Producer initialized!")
     
-    # Example: Create a beat
-    print("\nCreating a Travis Scott type beat...")
-    beat_audio, pattern = producer.create_beat('travis_scott', duration=8.0)
-    producer.audio_processor.save_audio(beat_audio, 'travis_scott_beat.wav')
-    print(f"Beat created with tempo: {pattern['tempo']} BPM")
-    
-    print("\nAI Producer ready for sampling and beat creation!")
+    if producer.prompt_interpreter:
+        print("AI prompt interpretation available!")
+        
+        # Example prompts
+        example_prompts = [
+            "Make me a Travis Scott type beat that's really dark and atmospheric",
+            "I want a Kanye West style beat with soul samples at 110 BPM",
+            "Create an aggressive Metro Boomin beat for 16 bars",
+            "Make a chill beat that sounds like it could be on Astroworld"
+        ]
+        
+        for i, prompt in enumerate(example_prompts):
+            print(f"\nExample {i+1}: '{prompt}'")
+            try:
+                audio, pattern, params = producer.create_beat_from_prompt(prompt)
+                filename = f"ai_generated_beat_{i+1}.wav"
+                producer.audio_processor.save_audio(audio, filename)
+                print(f"   Generated: {filename}")
+                print(f"   Style: {params['artist_style']}")
+                print(f"   Tempo: {params['tempo']} BPM")
+                print(f"   Mood: {params['mood']}")
+            except Exception as e:
+                print(f"   Error: {e}")
+    else:
+        print("AI prompt interpretation not available (no API key)")
+        # Fall back to standard beat generation
+        print("Creating standard beat...")
+        beat_audio, pattern = producer.create_beat('travis_scott')
+        producer.audio_processor.save_audio(beat_audio, 'standard_beat.wav')
+        print("Standard beat created!")
 
 if __name__ == "__main__":
     main()
